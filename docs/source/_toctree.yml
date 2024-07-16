@@ -17,6 +17,8 @@
     title: Installation from source
   - local: supported_models
     title: Supported Models and Hardware
+  - local: architecture
+    title: Internal Architecture
   title: Getting started
 - sections:
   - local: basic_tutorials/consuming_tgi
@@ -41,8 +43,6 @@
     title: Train Medusa
   title: Tutorials
 - sections:
-  - local: architecture
-    title: Internal Architecture
   - local: reference/launcher
     title: All TGI CLI options
   - local: reference/metrics
