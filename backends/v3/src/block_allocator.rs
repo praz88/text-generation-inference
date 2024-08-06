@@ -96,7 +96,11 @@ async fn block_allocator_task(
     window_size: Option<u32>,
     mut receiver: mpsc::UnboundedReceiver<BlockAllocatorCommand>,
 ) {
-    let mut allocator = SimpleAllocator::new(blocks, block_size, window_size);
+    let mut allocator: Box<dyn Allocator + Send> = if block_size == 1 {
+        Box::new(RadixAllocator::new(block_size, blocks, window_size))
+    } else {
+        Box::new(SimpleAllocator::new(blocks, block_size, window_size))
+    };
     while let Some(cmd) = receiver.recv().await {
         match cmd {
             BlockAllocatorCommand::Free {
