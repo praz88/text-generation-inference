@@ -10,7 +10,7 @@ pub(crate) struct BlockAllocation {
 
     /// Prefix that was cached and for which the KV does not have to
     /// be recomputed.
-    pub prefix_len: u64,
+    pub prefix_len: u32,
 
     pub allocation_id: u64,
 
@@ -129,7 +129,7 @@ enum BlockAllocatorCommand {
     Allocate {
         tokens: u32,
         prefill_tokens: Option<Arc<Vec<u32>>>,
-        response_sender: oneshot::Sender<Option<(Vec<u32>, Vec<u32>, u64, u64)>>,
+        response_sender: oneshot::Sender<Option<(Vec<u32>, Vec<u32>, u32, u64)>>,
     },
 }
 
@@ -138,7 +138,7 @@ pub trait Allocator {
         &mut self,
         tokens: u32,
         prefill_tokens: Option<Arc<Vec<u32>>>,
-    ) -> Option<(Vec<u32>, Vec<u32>, u64, u64)>;
+    ) -> Option<(Vec<u32>, Vec<u32>, u32, u64)>;
 
     fn free(&mut self, blocks: Vec<u32>, allocation_id: u64);
 }
@@ -165,7 +165,7 @@ impl Allocator for SimpleAllocator {
         &mut self,
         tokens: u32,
         _prefill_tokens: Option<Arc<Vec<u32>>>,
-    ) -> Option<(Vec<u32>, Vec<u32>, u64, u64)> {
+    ) -> Option<(Vec<u32>, Vec<u32>, u32, u64)> {
         // Apply window size
         let (required_blocks, repeats) = {
             let (tokens, repeats) = match self.window_size {
@@ -269,7 +269,7 @@ impl Allocator for RadixAllocator {
         &mut self,
         tokens: u32,
         prefill_tokens: Option<Arc<Vec<u32>>>,
-    ) -> Option<(Vec<u32>, Vec<u32>, u64, u64)> {
+    ) -> Option<(Vec<u32>, Vec<u32>, u32, u64)> {
         let mut blocks = vec![];
         let prefix_node = if let Some(prefill_tokens) = prefill_tokens.as_ref() {
             let node_id = self
@@ -308,7 +308,7 @@ impl Allocator for RadixAllocator {
         self.allocation_id += 1;
         self.allocations.insert(self.allocation_id, allocation);
 
-        Some((blocks, slots, prefix_len as u64, self.allocation_id))
+        Some((blocks, slots, prefix_len as u32, self.allocation_id))
     }
 
     fn free(&mut self, blocks: Vec<u32>, allocation_id: u64) {

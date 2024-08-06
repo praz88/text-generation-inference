@@ -327,11 +327,12 @@ impl State {
             // Update entry
             entry.temp_span = Some(entry_batch_span);
 
-            let (blocks, slots) = match &block_allocation {
-                None => (Vec::new(), Vec::new()),
+            let (blocks, slots, prefix_len) = match &block_allocation {
+                None => (Vec::new(), Vec::new(), 0),
                 Some(block_allocation) => (
                     block_allocation.blocks.clone(),
                     block_allocation.slots.clone(),
+                    block_allocation.prefix_len,
                 ),
             };
 
@@ -368,6 +369,7 @@ impl State {
                 top_n_tokens: entry.request.top_n_tokens,
                 blocks,
                 slots,
+                prefix_len,
                 adapter_id: entry.request.adapter_id.clone(),
             });
             // Set batch_time
