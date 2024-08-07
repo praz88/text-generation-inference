@@ -109,6 +109,9 @@ class FlashCausalLMBatch(Batch):
     block_tables_tensor: torch.Tensor
     # tensor of length \sum_{i=0}^{b} max_s_i  holding the paged attention slots for all sequences
     slots: torch.Tensor
+    # size [b], containing the number of blocks that can be retrieved from the cache
+    prefix_lens: List[int]
+    prefix_lens_tensor: torch.Tensor
 
     max_seqlen: int
 
@@ -211,6 +214,7 @@ class FlashCausalLMBatch(Batch):
 
         block_tables = []
         slots = []
+        prefix_lens = []
 
         # Parse batch
         for i, (r, tokenized_input) in enumerate(
@@ -272,12 +276,16 @@ class FlashCausalLMBatch(Batch):
                     for b in request_blocks
                     for s in range(b * BLOCK_SIZE, (b + 1) * BLOCK_SIZE)
                 ]
+                request_prefix_len = 0
             else:
                 request_blocks = r.blocks
                 request_slots = r.slots
+                request_prefix_len = r.prefix_len
+                logger.info(f"prefix len: {r.prefix_len}")
 
             block_tables.append(request_blocks)
             slots.extend(request_slots[:total_tokens])
+            prefix_lens.append(request_prefix_len)
             num_blocks += len(request_blocks)
             start_slots.append(cumulative_max_length)
 
@@ -402,6 +410,7 @@ class FlashCausalLMBatch(Batch):
         for i, request_blocks in enumerate(block_tables):
             block_tables_tensor[i, : len(request_blocks)] = torch.tensor(request_blocks)
         block_tables_tensor = block_tables_tensor.to(device)
+        prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
 
         return cls(
             batch_id=pb.id,
@@ -416,6 +425,8 @@ class FlashCausalLMBatch(Batch):
             block_tables=block_tables,
             block_tables_tensor=block_tables_tensor,
             slots=slots,
+            prefix_lens=prefix_lens,
+            prefix_lens_tensor=prefix_lens_tensor,
             max_seqlen=max_seqlen,
             prefill_head_indices=prefill_head_indices,
             prefill_next_token_indices=prefill_next_token_indices,
@@ -652,6 +663,7 @@ class FlashCausalLMBatch(Batch):
         block_tables_tensor = batches[0].block_tables_tensor.new_zeros(
             (total_batch_size, max_blocks)
         )
+        prefix_lens_tensor = batches[0].prefix_lens_tensor.new_empty(total_batch_size)
         all_input_ids_tensor = batches[0].all_input_ids_tensor.new_zeros(
             (total_batch_size, max_length)
         )
@@ -669,6 +681,7 @@ class FlashCausalLMBatch(Batch):
 
         start_slots = []
         block_tables = []
+        prefix_lens = []
         all_input_ids = []
 
         input_lengths = []
@@ -731,9 +744,12 @@ class FlashCausalLMBatch(Batch):
                 start_index:end_index, : batch.block_tables_tensor.shape[1]
             ] = batch.block_tables_tensor[:, :max_blocks]
 
+            prefix_lens_tensor[start_index:end_index] = batch.prefix_lens_tensor
+
             start_slots.append(batch.start_slots + cumulative_slots)
 
             block_tables.extend(batch.block_tables)
+            prefix_lens.extend(batch.prefix_lens)
             all_input_ids.extend(batch.all_input_ids)
 
             input_lengths.extend(batch.input_lengths)
@@ -780,6 +796,8 @@ class FlashCausalLMBatch(Batch):
             slot_indices=slot_indices,
             block_tables=block_tables,
             block_tables_tensor=block_tables_tensor,
+            prefix_lens=prefix_lens,
+            prefix_lens_tensor=prefix_lens_tensor,
             slots=slots,
             max_seqlen=max_seqlen,
             prefill_head_indices=None,
