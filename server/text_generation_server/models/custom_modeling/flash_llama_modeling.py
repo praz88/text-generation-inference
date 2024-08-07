@@ -21,6 +21,7 @@
 from contextlib import contextmanager
 from typing import List, Optional, Tuple
 
+from loguru import logger
 import torch
 import torch.distributed
 
@@ -31,6 +32,7 @@ from text_generation_server.utils.import_utils import SYSTEM
 from text_generation_server.layers.attention import (
     paged_attention,
     attention,
+    attention_with_cache,
     reshape_and_cache,
 )
 from text_generation_server.layers import (
@@ -211,18 +213,24 @@ class FlashLlamaAttention(torch.nn.Module):
 
         self.rotary_emb(query, torch.select(kv, dim=1, index=0), cos, sin)
 
+        # logger.info(f"kv shape: {kv.shape}, cache: {kv_cache[0].shape}")
+        # logger.info(f"slots: {slots.shape}, block_tables: {block_tables.shape}")
+
         reshape_and_cache(kv[:, 0], kv[:, 1], kv_cache[0], kv_cache[1], slots)
 
         # Prefill
         if cu_seqlen_prefill is not None:
             # flash attention
-            attn_output = attention(
-                query,
-                torch.select(kv, dim=1, index=0),
-                torch.select(kv, dim=1, index=1),
-                cu_seqlen_prefill,
-                max_s,
-                self.softmax_scale,
+            # attn_output = attention(
+            #    query,
+            #    torch.select(kv, dim=1, index=0),
+            #    torch.select(kv, dim=1, index=1),
+            #    cu_seqlen_prefill,
+            #    max_s,
+            #    self.softmax_scale,
+            # )
+            attn_output = attention_with_cache(
+                query, kv_cache[0], kv_cache[1], self.softmax_scale
             )
         # Decode
         else:

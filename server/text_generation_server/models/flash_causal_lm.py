@@ -20,6 +20,9 @@ from typing import Any, ContextManager, Iterable, Optional, Tuple, List, Type, D
 
 from text_generation_server.adapters import AdapterBatchData, AdapterBatchMetadata
 from huggingface_hub.constants import HUGGINGFACE_HUB_CACHE
+from text_generation_server.layers.attention.flash_infer import (
+    create_prefill_with_paged_kv_state,
+)
 from text_generation_server.utils.chunks import concat_text_chunks
 from text_generation_server.utils.import_utils import SYSTEM
 from text_generation_server.models import Model
@@ -230,6 +233,13 @@ class FlashCausalLMBatch(Batch):
             ):
                 tokenized_input = tokenized_input[1:]
 
+            orig_input_length = len(tokenized_input)
+            prefix_len = r.prefix_len if FLASH_INFER else 0
+            if prefix_len == orig_input_length:
+                assert prefix_len > 0
+                prefix_len -= 1
+            tokenized_input = tokenized_input[prefix_len:]
+
             input_length = len(tokenized_input)
             input_lengths.append(input_length)
 
@@ -239,7 +249,9 @@ class FlashCausalLMBatch(Batch):
             all_input_ids.append(tokenized_input)
 
             # Position ids
-            request_position_ids = torch.arange(0, input_length, dtype=torch.int32)
+            request_position_ids = torch.arange(
+                prefix_len, orig_input_length, dtype=torch.int32
+            )
             position_ids.append(request_position_ids)
 
             # Add cumulative lengths of all previous inputs
@@ -263,7 +275,7 @@ class FlashCausalLMBatch(Batch):
             # Remove one as the first token des not have a past
             speculative_length = get_speculate()
             speculative_length = 0 if speculative_length is None else speculative_length
-            total_tokens = input_length + max_new_tokens - 1 + speculative_length
+            total_tokens = orig_input_length + max_new_tokens - 1 + speculative_length
 
             # blocks and slots can be empty (for example in warmup)
             if not r.blocks:
@@ -276,16 +288,20 @@ class FlashCausalLMBatch(Batch):
                     for b in request_blocks
                     for s in range(b * BLOCK_SIZE, (b + 1) * BLOCK_SIZE)
                 ]
-                request_prefix_len = 0
             else:
                 request_blocks = r.blocks
-                request_slots = r.slots
-                request_prefix_len = r.prefix_len
-                logger.info(f"prefix len: {r.prefix_len}")
+                request_slots = r.slots[prefix_len:total_tokens]
+                logger.info(f"prefix len: {prefix_len}")
+
+            logger.info(f"request blocks: {request_blocks}")
 
             block_tables.append(request_blocks)
-            slots.extend(request_slots[:total_tokens])
-            prefix_lens.append(request_prefix_len)
+
+            logger.info(
+                f"requests slots: {request_slots}, without prefix: {request_slots[prefix_len:]}, with total tokens: {request_slots[prefix_len:][:total_tokens]}",
+            )
+            slots.extend(request_slots)
+            prefix_lens.append(prefix_len)
             num_blocks += len(request_blocks)
             start_slots.append(cumulative_max_length)
 
@@ -404,11 +420,22 @@ class FlashCausalLMBatch(Batch):
         )
 
         slots = torch.tensor(slots, dtype=torch.int64, device=device)
-        block_tables_tensor = torch.zeros(
-            (len(block_tables), max_blocks), dtype=torch.int32, device="cpu"
-        )
-        for i, request_blocks in enumerate(block_tables):
-            block_tables_tensor[i, : len(request_blocks)] = torch.tensor(request_blocks)
+
+        if FLASH_INFER:
+            block_tables_tensor = torch.cat(
+                [
+                    torch.tensor(block_table, dtype=torch.int32, device="cpu")
+                    for block_table in block_tables
+                ]
+            )
+        else:
+            block_tables_tensor = torch.zeros(
+                (len(block_tables), max_blocks), dtype=torch.int32, device="cpu"
+            )
+            for i, request_blocks in enumerate(block_tables):
+                block_tables_tensor[i, : len(request_blocks)] = torch.tensor(
+                    request_blocks
+                )
         block_tables_tensor = block_tables_tensor.to(device)
         prefix_lens_tensor = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
 
@@ -963,6 +990,9 @@ class FlashCausalLM(Model):
             )
 
             self.prefill_state = create_prefill_state(device=device)
+            self.prefill_with_paged_kv_state = create_prefill_with_paged_kv_state(
+                device=device
+            )
 
             if not CUDA_GRAPHS:
                 self.decode_state = create_decode_state(
@@ -1062,11 +1092,11 @@ class FlashCausalLM(Model):
         position_ids = torch.zeros(bs, dtype=torch.int32, device=self.device)
         slots = torch.arange(bs, dtype=torch.int64, device=self.device)
         input_lengths = torch.ones(bs, dtype=torch.int32, device=self.device) * max_s
-        block_tables = (
-            torch.arange(max_bt, dtype=torch.int32, device=self.device)
-            .repeat(bs)
-            .reshape((bs, max_bt))
-        )
+        block_tables = torch.arange(
+            max_bt, dtype=torch.int32, device=self.device
+        ).repeat(bs)
+        if not FLASH_INFER:
+            block_tables = block_tables.reshape((bs, max_bt))
 
         self.cuda_graphs[bs] = {
             "input_ids": input_ids,
@@ -1108,6 +1138,7 @@ class FlashCausalLM(Model):
             cu_seqlen_prefill=None,
             input_lengths=input_lengths,
             state=state,
+            prefix_lens=None,
         ):
             self.model.forward(
                 input_ids=input_ids,
@@ -1358,11 +1389,19 @@ class FlashCausalLM(Model):
         else:
             cuda_graph = None
 
+        logger.info(f"input_ids: {input_ids}")
+        logger.info(f"position_ids: {position_ids}")
+        logger.info(f"slots: {slots}")
+        logger.info(f"input_lengths: {input_lengths + batch.prefix_lens_tensor}")
+        logger.info(f"block_tables: {block_tables}")
+        logger.info(f"cu_seqlen_prefill: {cu_seqlen_prefill}")
+
         if cu_seqlen_prefill is not None or cuda_graph is None:
             with self._forward_context(
                 block_tables=block_tables,
                 cu_seqlen_prefill=cu_seqlen_prefill,
                 input_lengths=input_lengths,
+                prefix_lens=batch.prefix_lens_tensor,
             ):
                 input_lengths = Seqlen(input_lengths=input_lengths)
                 logits, speculative_logits = self.model.forward(
@@ -1386,19 +1425,25 @@ class FlashCausalLM(Model):
         # Static inputs are potentially padded
         cuda_graph["input_ids"][: input_ids.shape[0]] = input_ids
         cuda_graph["position_ids"][: position_ids.shape[0]] = position_ids
-        cuda_graph["block_tables"][
-            : block_tables.shape[0], : block_tables.shape[1]
-        ] = block_tables
+        if FLASH_INFER:
+            cuda_graph["block_tables"][: block_tables.shape[0]] = block_tables
+        else:
+            cuda_graph["block_tables"][
+                : block_tables.shape[0], : block_tables.shape[1]
+            ] = block_tables
         cuda_graph["slots"].fill_(-1)
         cuda_graph["slots"][: slots.shape[0]] = slots
         cuda_graph["input_lengths"].zero_()
-        cuda_graph["input_lengths"][: input_lengths.shape[0]] = input_lengths
+        cuda_graph["input_lengths"][: input_lengths.shape[0]] = (
+            input_lengths + batch.prefix_lens_tensor
+        )
 
         state = cuda_graph.get("state")
         with self._forward_context(
             block_tables=block_tables,
             cu_seqlen_prefill=None,
-            input_lengths=input_lengths,
+            input_lengths=input_lengths + batch.prefix_lens_tensor,
+            prefix_lens=None,
             state=state,
         ):
             # Replay the graph
@@ -1782,6 +1827,7 @@ class FlashCausalLM(Model):
         block_tables: torch.Tensor,
         cu_seqlen_prefill: Optional[torch.Tensor],
         input_lengths: torch.Tensor,
+        prefix_lens: Optional[torch.Tensor],
         state: Optional[Any] = None,
     ) -> ContextManager:
         if not FLASH_INFER:
@@ -1790,16 +1836,36 @@ class FlashCausalLM(Model):
         from text_generation_server.layers.attention.flash_infer import (
             use_decode_state,
             use_prefill_state,
+            use_prefill_with_paged_kv_state,
         )
 
+        # has_prefix_lens = any(prefix_len > 0 for prefix_len in prefix_lens)
+
         if cu_seqlen_prefill is not None:
-            return use_prefill_state(
-                state=state if state is not None else self.prefill_state,
-                cu_seqlens=cu_seqlen_prefill,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_size=self.head_size,
-            )
+            if True:  # has_prefix_lens:
+                assert prefix_lens is not None
+                # logger.info(f"context prefix lens: {prefix_lens}")
+                # logger.info(f"context input lens: {input_lengths}")
+                return use_prefill_with_paged_kv_state(
+                    state=(
+                        state if state is not None else self.prefill_with_paged_kv_state
+                    ),
+                    block_tables=block_tables.view(-1),
+                    cu_seqlens=cu_seqlen_prefill,
+                    input_lengths=input_lengths + prefix_lens,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                    page_size=BLOCK_SIZE,
+                )
+            else:
+                return use_prefill_state(
+                    state=state if state is not None else self.prefill_state,
+                    cu_seqlens=cu_seqlen_prefill,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_size=self.head_size,
+                )
         else:
             assert input_lengths is not None
             return use_decode_state(

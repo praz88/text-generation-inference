@@ -240,6 +240,26 @@ if FLASH_INFER:
             sm_scale=softmax_scale,
         )
 
+    def attention_with_cache(
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        softmax_scale,
+        causal=True,
+        softcap=0.0,
+    ):
+        from text_generation_server.layers.attention.flash_infer import (
+            prefill_with_paged_kv_state,
+        )
+
+        return prefill_with_paged_kv_state.get().forward(
+            q.contiguous(),
+            causal=causal,
+            paged_kv_cache=(key_cache, value_cache),
+            logits_soft_cap=softcap,
+            sm_scale=softmax_scale,
+        )
+
 elif V2:
 
     def attention(

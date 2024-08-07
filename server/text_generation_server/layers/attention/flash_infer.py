@@ -68,12 +68,17 @@ def use_prefill_with_paged_kv_state(
     indptr[1:].cumsum_(-1)
 
     # Get the lengths of the last page in a block.
-    last_page_len = torch.empty(
-        input_lengths.shape[0], dtype=torch.int32, device=input_lengths.device
-    )
-    torch.sub(input_lengths, 1, out=last_page_len)
-    last_page_len.remainder_(page_size)
-    last_page_len += 1
+    if page_size == 1:
+        last_page_len = torch.ones(
+            input_lengths.shape[0], dtype=torch.int32, device=input_lengths.device
+        )
+    else:
+        last_page_len = torch.empty(
+            input_lengths.shape[0], dtype=torch.int32, device=input_lengths.device
+        )
+        torch.sub(input_lengths, 1, out=last_page_len)
+        last_page_len.remainder_(page_size)
+        last_page_len += 1
 
     token = prefill_with_paged_kv_state.set(state)
     try:
